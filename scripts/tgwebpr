@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# tgwebpr — управление tg-web-proxy
+set -euo pipefail
+
+CONF="/etc/default/tgwebpr"
+INSTALL_DIR="/opt/tg-web-proxy"
+IN_MENU=0
+
+if [[ -f "$CONF" ]]; then
+	# shellcheck disable=SC1090
+	source "$CONF"
+fi
+
+if [[ -f "$INSTALL_DIR/scripts/ui.sh" ]]; then
+	# shellcheck source=scripts/ui.sh
+	source "$INSTALL_DIR/scripts/ui.sh"
+else
+	UI_RESET=$'\033[0m' UI_BOLD=$'\033[1m' UI_DIM=$'\033[2m'
+	UI_CYAN=$'\033[36m' UI_GREEN=$'\033[32m' UI_YELLOW=$'\033[33m'
+	UI_RED=$'\033[31m' UI_BLUE=$'\033[34m'
+	ui_out() { printf '%b' "$1" >/dev/tty 2>/dev/null || printf '%b' "$1"; }
+	ui_ok() { ui_out "  ${UI_GREEN}✓${UI_RESET} $1\n"; }
+	ui_warn() { ui_out "  ${UI_YELLOW}!${UI_RESET} $1\n"; }
+	ui_fail() { ui_out "  ${UI_RED}✗${UI_RESET} $1\n"; }
+	ui_info() { ui_out "  ${UI_DIM}·${UI_RESET} $1\n"; }
+	ui_line() { ui_out "${UI_DIM}────────────────────────────────────────────────${UI_RESET}\n"; }
+	ui_box() {
+		local title="$1"; shift
+		ui_line
+		ui_out "${UI_BOLD}${title}${UI_RESET}\n"
+		while [[ $# -gt 0 ]]; do ui_out "  $1\n"; shift; done
+		ui_line
+	}
+	ui_ask() {
+		local p="$1" d="${2:-}" r=""
+		[[ -n "$d" ]] && ui_out "${UI_BOLD}${p}${UI_RESET} [${d}]: " || ui_out "${UI_BOLD}${p}${UI_RESET}: "
+		IFS= read -r r < /dev/tty || r=""
+		[[ -z "$r" && -n "$d" ]] && r="$d"
+		printf '%s' "$r"
+	}
+	ui_ask_yes() {
+		local p="$1" d="${2:-y}" r=""
+		[[ "$d" == "y" ]] && hint='Y/n' || hint='y/N'
+		ui_out "${UI_BOLD}${p}${UI_RESET} (${hint}): "
+		IFS= read -r r < /dev/tty || r=""
+		r="$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')"
+		[[ -z "$r" ]] && r="$d"
+		[[ "$r" == "y" || "$r" == "yes" || "$r" == "д" || "$r" == "да" ]]
+	}
+	ui_pick_site() { printf '%s' "${2:-studio-garden}"; }
+fi
+
+# цвета даже если stdin не TTY (меню читает /dev/tty)
+if [[ -r /dev/tty && -w /dev/tty ]]; then
+	UI_RESET=$'\033[0m' UI_BOLD=$'\033[1m' UI_DIM=$'\033[2m'
+	UI_CYAN=$'\033[36m' UI_GREEN=$'\033[32m' UI_YELLOW=$'\033[33m'
+	UI_RED=$'\033[31m' UI_BLUE=$'\033[34m'
+fi
+
+SITE_IDS=()
+SITE_LABELS=()
+if [[ -f "$INSTALL_DIR/scripts/sites.sh" ]]; then
+	# shellcheck source=scripts/sites.sh
+	source "$INSTALL_DIR/scripts/sites.sh"
+	load_site_catalog "$INSTALL_DIR"
+fi
+
+CARRIER_MODES=(https https-lanes websocket websocket-lanes)
+CARRIER_LABELS=(
+	'https — совместимость, медленнее на Desktop'
+	'https-lanes — параллельные HTTP-потоки'
+	'websocket — рекомендуется для Telegram Desktop'
+	'websocket-lanes — WebSocket на каждый поток'
+)
+
+ensure_carrier_env() {
+	local mode="${1:-websocket}"
+	[[ -f "$INSTALL_DIR/.env" ]] || return 0
+	if grep -q '^CARRIER_MODE=' "$INSTALL_DIR/.env" 2>/dev/null; then
+		return 0
+	fi
+	printf 'CARRIER_MODE=%s\n' "$mode" >>"$INSTALL_DIR/.env"
+	chmod 0600 "$INSTALL_DIR/.env"
+	ui_info "добавлен CARRIER_MODE=${mode} — перезапуск контейнера"
+	compose up -d >/dev/null 2>&1 || compose restart tproxy >/dev/null 2>&1 || true
+}
+
+ensure_backend_env() {
+	local engine="${1:-telemt}"
+	[[ -f "$INSTALL_DIR/.env" ]] || return 0
+	if grep -q '^BACKEND=' "$INSTALL_DIR/.env" 2>/dev/null; then
+		return 0
+	fi
+	printf 'BACKEND=%s\n' "$engine" >>"$INSTALL_DIR/.env"
+	chmod 0600 "$INSTALL_DIR/.env"
+	ui_info "добавлен BACKEND=${engine} — нужен rebuild: tgwebpr update"
+}
+
+set_carrier_mode() {
+	local mode="$1"
+	local valid=0 m
+	for m in "${CARRIER_MODES[@]}"; do
+		[[ "$m" == "$mode" ]] && valid=1 && break
+	done
+	if [[ "$valid" -ne 1 ]]; then
+		ui_fail "неизвестный режим: $mode"
+		return 1
+	fi
+	if grep -q '^CARRIER_MODE=' "$INSTALL_DIR/.env" 2>/dev/null; then
+		sed -i "s/^CARRIER_MODE=.*/CARRIER_MODE=$mode/" "$INSTALL_DIR/.env"
+	else
+		printf 'CARRIER_MODE=%s\n' "$mode" >>"$INSTALL_DIR/.env"
+	fi
+	chmod 0600 "$INSTALL_DIR/.env"
+	compose_reload_env
+	ui_ok "carrier: $mode"
+}
+
+require_installed() {
+	if [[ ! -f "$INSTALL_DIR/docker-compose.yml" || ! -f "$INSTALL_DIR/.env" ]]; then
+		ui_fail "нет установки в $INSTALL_DIR"
+		exit 1
+	fi
+}
+
+require_root() {
+	if [[ "$(id -u)" -ne 0 ]]; then
+		ui_fail 'нужен root: sudo tgwebpr'
+		exit 1
+	fi
+}
+
+load_env() {
+	require_installed
+	set -a
+	# shellcheck disable=SC1091
+	source "$INSTALL_DIR/.env"
+	set +a
+}
+
+compose() {
+	require_root
+	(
+		cd "$INSTALL_DIR"
+		docker compose --env-file .env "$@"
+	)
+}
+
+# .env changes are not always picked up by plain `up -d` — recreate the container.
+compose_reload_env() {
+	compose up -d --force-recreate
+}
+
+pause_menu() {
+	[[ "$IN_MENU" -eq 1 ]] || return 0
+	ui_out "\n${UI_DIM}Enter — в меню${UI_RESET}"
+	IFS= read -r _ < /dev/tty || true
+}
+
+clear_screen() {
+	if [[ -t 1 ]] || [[ -w /dev/tty ]]; then
+		printf '\033[H\033[2J' >/dev/tty 2>/dev/null || printf '\033[H\033[2J'
+	fi
+}
+
+cmd_status() {
+	load_env
+	require_root
+	ensure_carrier_env websocket
+	ensure_backend_env telemt
+	# shellcheck disable=SC1091
+	set -a; source "$INSTALL_DIR/.env" 2>/dev/null || true; set +a
+	ui_out "  ${UI_DIM}проверяю…${UI_RESET}\n"
+
+	container='нет'
+	if compose ps --status running --format '{{.Name}}' 2>/dev/null | grep -q .; then
+		container='да'
+	elif compose ps -q 2>/dev/null | grep -q .; then
+		container='есть (не running?)'
+	fi
+
+	ready='нет'
+	if timeout 5 docker exec tg-web-proxy curl --fail --silent --max-time 3 \
+		http://127.0.0.1:8081/readyz >/dev/null 2>&1; then
+		ready='да'
+	fi
+
+	https='нет'
+	# Caddy слушает внутри контейнера — надёжнее, чем curl с хоста через docker-proxy
+	if timeout 8 docker exec tg-web-proxy curl --fail --silent --max-time 5 \
+		--resolve "${TPROXY_HOSTNAME}:443:127.0.0.1" \
+		"https://${TPROXY_HOSTNAME}/" >/dev/null 2>&1; then
+		https='да'
+	elif timeout 8 curl -4 --fail --silent --max-time 5 \
+		--resolve "${TPROXY_HOSTNAME}:443:127.0.0.1" \
+		"https://${TPROXY_HOSTNAME}/" >/dev/null 2>&1; then
+		https='да (host)'
+	fi
+
+	backend='?'
+	bytes_up=''
+	bytes_down=''
+	relay_status='?'
+	if metrics="$(timeout 5 docker exec tg-web-proxy curl --silent --max-time 3 \
+		http://127.0.0.1:8081/metrics 2>/dev/null)"; then
+		failures="$(printf '%s\n' "$metrics" | awk -F' ' '/^tproxy_backend_dial_failures_total /{print $2; exit}')"
+		sessions="$(printf '%s\n' "$metrics" | awk -F' ' '/^tproxy_sessions_live /{print $2; exit}')"
+		bytes_up="$(printf '%s\n' "$metrics" | awk -F' ' '/^tproxy_bytes_up_total /{print $2; exit}')"
+		bytes_down="$(printf '%s\n' "$metrics" | awk -F' ' '/^tproxy_bytes_down_total /{print $2; exit}')"
+		if [[ -n "${failures:-}" && "${failures}" != "0" ]]; then
+			relay_status="dial_failures=${failures}"
+		elif [[ -n "${sessions:-}" && "${sessions}" != "0" ]]; then
+			relay_status="sessions=${sessions}"
+		else
+			relay_status='ok'
+		fi
+	fi
+
+	carrier="${CARRIER_MODE:-?}"
+	backend_engine="${BACKEND:-telemt}"
+	ad_env="${MTPROXY_AD_TAG:-—}"
+	ad_telemt='—'
+	me_telemt='?'
+	if telemt_cfg="$(timeout 5 docker exec tg-web-proxy cat /etc/telemt/telemt.toml 2>/dev/null)"; then
+		ad_telemt="$(printf '%s\n' "$telemt_cfg" | awk -F'"' '/^ad_tag = /{print $2; exit}')"
+		[[ -z "$ad_telemt" ]] && ad_telemt='—'
+		me_telemt="$(printf '%s\n' "$telemt_cfg" | awk -F' = ' '/^use_middle_proxy = /{print $2; exit}')"
+	fi
+	carrier_hint=''
+	if [[ "${carrier}" == "https" ]]; then
+		carrier_hint=' · для Desktop лучше: tgwebpr carrier'
+	fi
+
+	ui_box 'Статус' \
+		"Hostname : ${TPROXY_HOSTNAME}" \
+		"Site     : ${SITE_VARIANT:-?}" \
+		"Carrier  : ${carrier}${carrier_hint}" \
+		"Engine   : ${backend_engine} → :2398" \
+		"Promo    : .env=${ad_env} · telemt=${ad_telemt} · ME=${me_telemt}" \
+		"Контейнер: ${container}" \
+		"Ready    : ${ready}" \
+		"HTTPS    : ${https}" \
+		"Relay    : ${relay_status}" \
+		"Traffic  : up=${bytes_up:-?} down=${bytes_down:-?} bytes"
+
+	if [[ "$ready" == "да" ]]; then
+		if [[ "$https" == "нет" ]]; then
+			ui_warn 'HTTPS-проверка не прошла — если сайт открывается в браузере, это ложный минус'
+		fi
+		if [[ "$https" == да* && "${relay_status}" == "ok" ]]; then
+			ui_ok 'стек в порядке — переподключите WEB proxy в Telegram (tgwebpr creds)'
+		fi
+		ui_info 'если TG «подключён», но чаты пустые — пересоздайте proxy в Settings → Advanced → Proxy'
+		if [[ "${relay_status:-}" == dial_failures=* && "${relay_status#dial_failures=}" != "0" ]]; then
+			ui_warn 'relay не всегда достучался до backend :2398 — tgwebpr restart'
+		fi
+		if [[ -n "${bytes_up:-}" && -n "${bytes_down:-}" && "${bytes_up}" -gt 10000 && "${bytes_down}" -lt 10000 ]]; then
+			ui_warn 'мало downlink — backend не отдаёт ответы из Telegram'
+			ui_info 'попробуйте BACKEND=telemt в .env и tgwebpr update'
+		fi
+		if [[ "$ad_env" == "—" ]]; then
+			ui_warn 'ad tag не задан в .env — promo не работает (tgwebpr proxy → пункт 4)'
+		elif [[ "$ad_telemt" == "—" || "$ad_env" != "$ad_telemt" ]]; then
+			ui_warn 'ad tag в .env не попал в telemt — tgwebpr update (нужен --build после git pull)'
+		elif [[ "$me_telemt" != "true" ]]; then
+			ui_warn 'ME pool выключен — для promo нужен use_middle_proxy=true'
+		fi
+	fi
+
+	ui_out '\n'
+	compose ps 2>/dev/null || true
+	pause_menu
+}
+
+cmd_creds() {
+	load_env
+	ui_box 'Telegram · WEB' \
+		"Hostname : ${TPROXY_HOSTNAME}" \
+		"Key      : ${TPROXY_SECRET}" \
+		"" \
+		"tg://webproxy?server=${TPROXY_HOSTNAME}&secret=${TPROXY_SECRET}"
+	pause_menu
+}
+
+cmd_logs() {
+	lines="${1:-80}"
+	require_root
+	ui_info 'логи — Ctrl+C чтобы вернуться в меню'
+	ui_out '\n'
+	set +e
+	(
+		trap 'exit 0' INT
+		compose logs --tail="$lines" -f tproxy
+	)
+	set -e
+	ui_out '\n'
+	ui_ok 'логи закрыты'
+	pause_menu
+}
+
+cmd_restart() {
+	require_root
+	ui_out "  ${UI_DIM}перезапуск…${UI_RESET}\n"
+	compose restart tproxy
+	ui_ok 'готово'
+	cmd_status
+}
+
+cmd_update() {
+	require_root
+	require_installed
+	cd "$INSTALL_DIR"
+
+	git_ok=0
+	if [[ -d .git ]]; then
+		ui_out "  ${UI_DIM}git pull…${UI_RESET}\n"
+		if timeout 30 git fetch origin main 2>/tmp/tgwebpr-git.err; then
+			if git pull --ff-only origin main 2>>/tmp/tgwebpr-git.err; then
+				git_ok=1
+				ui_ok 'код обновлён'
+			fi
+		fi
+		if [[ "$git_ok" -eq 0 ]]; then
+			err="$(tr '\n' ' ' </tmp/tgwebpr-git.err 2>/dev/null || true)"
+			ui_warn "git недоступен (${err:-timeout/DNS})"
+			ui_info 'пересобираю то, что уже лежит на диске'
+		fi
+	else
+		ui_warn 'нет .git — только rebuild локального дерева'
+	fi
+
+	# обновить CLI на всякий случай
+	if [[ -f "$INSTALL_DIR/scripts/tgwebpr" ]]; then
+		install -m 0755 "$INSTALL_DIR/scripts/tgwebpr" /usr/local/bin/tgwebpr
+	fi
+
+	ensure_carrier_env websocket
+	ensure_backend_env telemt
+
+	ui_out "  ${UI_DIM}docker compose build…${UI_RESET}\n"
+	compose up -d --build --force-recreate
+	ui_ok 'контейнер пересобран'
+	cmd_status
+}
+
+apply_site() {
+	local site="$1"
+	local site_dir="$INSTALL_DIR/web/sites/$site"
+	if [[ ! -f "$site_dir/index.html" ]]; then
+		ui_fail "нет шаблона: $site"
+		return 1
+	fi
+	mkdir -p "$INSTALL_DIR/runtime/site"
+	if command -v rsync >/dev/null 2>&1; then
+		rsync -a --delete "$site_dir/" "$INSTALL_DIR/runtime/site/"
+	else
+		find "$INSTALL_DIR/runtime/site" -mindepth 1 -delete 2>/dev/null || true
+		cp -a "$site_dir/." "$INSTALL_DIR/runtime/site/"
+	fi
+	if grep -q '^SITE_VARIANT=' "$INSTALL_DIR/.env" 2>/dev/null; then
+		sed -i "s/^SITE_VARIANT=.*/SITE_VARIANT=$site/" "$INSTALL_DIR/.env"
+	else
+		printf 'SITE_VARIANT=%s\n' "$site" >>"$INSTALL_DIR/.env"
+	fi
+	chmod 0600 "$INSTALL_DIR/.env"
+	# сайт монтируется в контейнер — рестарт подхватывает файлы из volume
+	compose restart tproxy >/dev/null 2>&1 || compose up -d
+	ui_ok "сайт: $site"
+}
+
+cmd_site() {
+	require_root
+	load_env
+	load_site_catalog "$INSTALL_DIR"
+	if [[ ${#SITE_IDS[@]} -eq 0 ]]; then
+		ui_fail 'нет шаблонов в web/sites/'
+		pause_menu
+		return 1
+	fi
+	ui_out "\n${UI_BOLD}Шаблон сайта на ${TPROXY_HOSTNAME}${UI_RESET}\n"
+	ui_info "сейчас: ${SITE_VARIANT:-?}"
+	ui_info 'Enter = отмена'
+	ui_out '\n'
+	local i=1
+	for label in "${SITE_LABELS[@]}"; do
+		ui_out "  ${UI_CYAN}${i})${UI_RESET}  ${SITE_IDS[$((i - 1))]} — ${label}\n"
+		i=$((i + 1))
+	done
+	ui_out '\n'
+	local choice site max="${#SITE_IDS[@]}"
+	choice="$(ui_ask 'Номер или id' '')"
+	[[ -z "$choice" ]] && { ui_info 'отменено'; pause_menu; return 0; }
+	if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= max )); then
+		site="${SITE_IDS[$((choice - 1))]}"
+	else
+		site="$choice"
+	fi
+	apply_site "$site"
+	pause_menu
+}
+
+cmd_carrier() {
+	require_root
+	load_env
+	ensure_carrier_env websocket
+	ensure_backend_env telemt
+	# shellcheck disable=SC1091
+	set -a; source "$INSTALL_DIR/.env" 2>/dev/null || true; set +a
+	ui_out "\n${UI_BOLD}Режим carrier (транспорт Telegram)${UI_RESET}\n"
+	ui_info "сейчас: ${CARRIER_MODE:-https}"
+	ui_info 'Enter = отмена'
+	ui_out '\n'
+	local i=1
+	for label in "${CARRIER_LABELS[@]}"; do
+		ui_out "  ${UI_CYAN}${i})${UI_RESET}  ${label}\n"
+		i=$((i + 1))
+	done
+	ui_out '\n'
+	local choice mode
+	choice="$(ui_ask 'Номер' '')"
+	[[ -z "$choice" ]] && { ui_info 'отменено'; pause_menu; return 0; }
+	if [[ "$choice" =~ ^[1-4]$ ]]; then
+		mode="${CARRIER_MODES[$((choice - 1))]}"
+	else
+		mode="$choice"
+	fi
+	set_carrier_mode "$mode"
+	pause_menu
+}
+
+set_env_var() {
+	local key="$1"
+	local val="$2"
+	if grep -q "^${key}=" "$INSTALL_DIR/.env" 2>/dev/null; then
+		sed -i "s/^${key}=.*/${key}=${val}/" "$INSTALL_DIR/.env"
+	else
+		printf '%s=%s\n' "$key" "$val" >>"$INSTALL_DIR/.env"
+	fi
+	chmod 0600 "$INSTALL_DIR/.env"
+}
+
+clear_env_var() {
+	local key="$1"
+	if grep -q "^${key}=" "$INSTALL_DIR/.env" 2>/dev/null; then
+		sed -i "/^${key}=/d" "$INSTALL_DIR/.env"
+		chmod 0600 "$INSTALL_DIR/.env"
+	fi
+}
+
+set_backend_engine() {
+	local engine="$1"
+	case "$engine" in
+		telemt|mtproxy) ;;
+		*) ui_fail "backend: telemt или mtproxy"; return 1 ;;
+	esac
+	set_env_var BACKEND "$engine"
+	compose_reload_env
+	ui_ok "backend: $engine"
+}
+
+set_middle_proxy() {
+	local val="$1"
+	case "$val" in
+		true|false) ;;
+		*) ui_fail "нужно true или false"; return 1 ;;
+	esac
+	set_env_var TELEMT_MIDDLE_PROXY "$val"
+	compose_reload_env
+	ui_ok "TELEMT_MIDDLE_PROXY=$val"
+}
+
+set_ad_tag() {
+	local tag="${1,,}"
+	if [[ -z "$tag" ]]; then
+		clear_env_var MTPROXY_AD_TAG
+		compose_reload_env
+		ui_ok 'ad tag удалён'
+		return 0
+	fi
+	if [[ ! "$tag" =~ ^[0-9a-f]{32}$ ]]; then
+		ui_fail 'ad tag: ровно 32 hex-символа из @MTProxybot'
+		return 1
+	fi
+	set_env_var MTPROXY_AD_TAG "$tag"
+	set_env_var TELEMT_MIDDLE_PROXY true
+	compose_reload_env
+	ui_ok 'ad tag сохранён (ME pool включён — нужен для promo в telemt)'
+}
+
+cmd_proxy() {
+	require_root
+	load_env
+	ensure_carrier_env websocket
+	ensure_backend_env telemt
+	# shellcheck disable=SC1091
+	set -a; source "$INSTALL_DIR/.env" 2>/dev/null || true; set +a
+	while true; do
+		ui_out "\n${UI_BOLD}MTProxy / telemt${UI_RESET}\n"
+		ui_info "backend : ${BACKEND:-telemt}"
+		ui_info "carrier : ${CARRIER_MODE:-websocket}"
+		ui_info "ad tag  : ${MTPROXY_AD_TAG:-—}"
+		ui_info "ME pool : ${TELEMT_MIDDLE_PROXY:-false}"
+		ui_out '\n'
+		ui_out "  ${UI_CYAN}1${UI_RESET}  backend → telemt\n"
+		ui_out "  ${UI_CYAN}2${UI_RESET}  backend → official MTProxy\n"
+		ui_out "  ${UI_CYAN}3${UI_RESET}  carrier (websocket / https …)\n"
+		ui_out "  ${UI_CYAN}4${UI_RESET}  ad tag — канал @MTProxybot\n"
+		ui_out "  ${UI_CYAN}5${UI_RESET}  middle-end pool (telemt on/off)\n"
+		ui_out "  ${UI_CYAN}0${UI_RESET}  назад\n\n"
+		local choice
+		choice="$(ui_ask 'Пункт' '')"
+		case "$choice" in
+			0|'') pause_menu; return 0 ;;
+			1) set_backend_engine telemt ;;
+			2) set_backend_engine mtproxy ;;
+			3) cmd_carrier; return 0 ;;
+			4)
+				ui_info '32 hex из @MTProxybot; пусто = удалить'
+				tag="$(ui_ask 'Ad tag' '')"
+				set_ad_tag "$tag"
+				;;
+			5)
+				mp="$(ui_ask 'ME pool (true/false)' "${TELEMT_MIDDLE_PROXY:-false}")"
+				set_middle_proxy "$mp"
+				;;
+			*) ui_warn '0–5' ;;
+		esac
+	done
+}
+
+cmd_uninstall() {
+	require_root
+	require_installed
+	ui_warn "удаление ${INSTALL_DIR}"
+	if ! ui_ask_yes 'Удалить WEB proxy с этого сервера?' 'n'; then
+		ui_info 'отменено'
+		pause_menu
+		return 0
+	fi
+	cd "$INSTALL_DIR"
+	compose down -v 2>/dev/null || compose down 2>/dev/null || true
+	rm -f /usr/local/bin/tgwebpr
+	rm -f "$CONF"
+	if ui_ask_yes "Стереть каталог ${INSTALL_DIR}?" 'n'; then
+		rm -rf "$INSTALL_DIR"
+		ui_ok 'каталог удалён'
+	else
+		ui_info "оставлен: ${INSTALL_DIR}"
+	fi
+	ui_ok 'готово'
+	IN_MENU=0
+}
+
+draw_menu() {
+	clear_screen
+	ui_out "${UI_CYAN}${UI_BOLD}
+  ┌─────────────────────────────────────┐
+  │            tgwebpr                  │
+  └─────────────────────────────────────┘
+${UI_RESET}"
+	if [[ -f "$INSTALL_DIR/.env" ]]; then
+		# shellcheck disable=SC1091
+		set -a; source "$INSTALL_DIR/.env" 2>/dev/null || true; set +a
+		ui_out "  ${UI_DIM}${TPROXY_HOSTNAME:-?} · ${SITE_VARIANT:-?}${UI_RESET}\n\n"
+	else
+		ui_out '\n'
+	fi
+	ui_out "  ${UI_CYAN}1${UI_RESET}  статус\n"
+	ui_out "  ${UI_CYAN}2${UI_RESET}  hostname и key\n"
+	ui_out "  ${UI_CYAN}3${UI_RESET}  логи          ${UI_DIM}(Ctrl+C → меню)${UI_RESET}\n"
+	ui_out "  ${UI_CYAN}4${UI_RESET}  перезапуск\n"
+	ui_out "  ${UI_CYAN}5${UI_RESET}  обновить\n"
+	ui_out "  ${UI_CYAN}6${UI_RESET}  сменить сайт\n"
+	ui_out "  ${UI_CYAN}7${UI_RESET}  carrier\n"
+	ui_out "  ${UI_CYAN}8${UI_RESET}  MTProxy / telemt ${UI_DIM}(ad tag, backend)${UI_RESET}\n"
+	ui_out "  ${UI_CYAN}9${UI_RESET}  удалить\n"
+	ui_out "  ${UI_CYAN}0${UI_RESET}  выход\n"
+	ui_out '\n'
+}
+
+cmd_menu() {
+	IN_MENU=1
+	while true; do
+		draw_menu
+		choice="$(ui_ask '›' '')"
+		choice="$(printf '%s' "$choice" | tr '[:upper:]' '[:lower:]')"
+		clear_screen
+		case "$choice" in
+			1|s|status) cmd_status ;;
+			2|c|creds) cmd_creds ;;
+			3|l|logs) cmd_logs 80 ;;
+			4|r|restart) cmd_restart ;;
+			5|u|update) cmd_update ;;
+			6|site|w) cmd_site ;;
+			7|carrier|t) cmd_carrier ;;
+			8|proxy|p|backend) cmd_proxy ;;
+			9|x|uninstall) cmd_uninstall; break ;;
+			0|q|quit|exit|'') break ;;
+			*) ui_warn '1–9 или 0'; sleep 1 ;;
+		esac
+	done
+}
+
+usage() {
+	cat <<EOF
+tgwebpr
+
+  tgwebpr              меню
+  tgwebpr status
+  tgwebpr creds
+  tgwebpr logs [N]
+  tgwebpr restart
+  tgwebpr update
+  tgwebpr site         сменить HTML-шаблон
+  tgwebpr carrier      режим транспорта (websocket / https …)
+  tgwebpr proxy        backend, ad tag, ME pool
+  tgwebpr uninstall
+EOF
+}
+
+install_cli() {
+	local root="$1"
+	require_root
+	install -m 0755 "$root/scripts/tgwebpr" /usr/local/bin/tgwebpr
+	cat >"$CONF" <<EOF
+INSTALL_DIR=$root
+EOF
+	chmod 0644 "$CONF"
+}
+
+case "${1:-menu}" in
+	menu|'') cmd_menu ;;
+	status|st) cmd_status ;;
+	creds|cred|show) cmd_creds ;;
+	logs|log) cmd_logs "${2:-50}" ;;
+	restart) cmd_restart ;;
+	update) cmd_update ;;
+	site|template) cmd_site ;;
+	carrier|transport) cmd_carrier ;;
+	proxy|backend|mtproxy) cmd_proxy ;;
+	uninstall|remove) cmd_uninstall ;;
+	_install_cli) install_cli "${2:?}" ;;
+	-h|--help|help) usage ;;
+	*) ui_fail "неизвестная команда: $1"; usage; exit 2 ;;
+esac

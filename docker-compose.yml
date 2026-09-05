@@ -13,6 +13,8 @@ services:
     volumes:
       - ./runtime/site:/srv/tproxy-site:ro
       - caddy_data:/data/caddy
+      - caddy_config:/config/caddy
+      - /root/cert:/etc/caddy/certs:ro
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8081/readyz"]
       interval: 30s
@@ -22,3 +24,4 @@ services:
 
 volumes:
   caddy_data:
+  caddy_config:

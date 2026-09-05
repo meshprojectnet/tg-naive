@@ -1,11 +1,7 @@
 {
-	email {$ACME_EMAIL}
 	admin off
 	servers {
 		protocols h1 h2
-		# read_body maps to Go's ReadTimeout; it must stay well above the
-		# relay's long_poll (25s) so parked polls are never cut, while still
-		# bounding a slow-body client at this hop too.
 		timeouts {
 			read_header 10s
 			read_body 60s
@@ -14,12 +10,8 @@
 }
 
 {$TPROXY_HOSTNAME} {
-	# One backend serves the whole surface — the operator site, the bridge page
-	# for a valid capability, and the API. Proxying every path (not just
-	# `/` and `/api/v1/*`) keeps one public gateway for static or delegated
-	# application responses and the transport. No file_server or separate
-	# site route exposes different encoding, range, method, or proxy behavior.
-	# `encode` applies only to the public site; carrier API bodies stay raw.
+	tls /etc/caddy/certs/endpoint.hy2.fun/fullchain.pem /etc/caddy/certs/endpoint.hy2.fun/privkey.pem
+
 	@site not path /api/*
 	encode @site zstd gzip
 	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
@@ -29,9 +21,6 @@
 		}
 	}
 
-	# When the backend is down every path looks the same "backend unavailable",
-	# which is indistinguishable from any other backend-down site; no path is
-	# special-cased here.
 	handle_errors {
 		header {
 			Cache-Control "no-store"

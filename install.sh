@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# tg-naive · установщик на VPS
+# tg-naive · установщик на VPS (использование собственных SSL-сертификатов)
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/meshprojectnet/tg-naive/main/install.sh)
 #
-# Можно без флагов — спросит hostname, email и сайт в диалоге.
-# Или сразу: --hostname proxy.example.com --email you@example.com --site atlas-books
+# Можно без флагов — спросит hostname и сайт в диалоге.
+# Или сразу: --hostname proxy.example.com --site atlas-books
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/tg-naive}"
@@ -12,7 +12,6 @@ REPO_URL="${REPO_URL:-https://github.com/meshprojectnet/tg-naive.git}"
 REPO_REF="${REPO_REF:-main}"
 
 hostname=""
-email=""
 site=""
 secret=""
 assume_yes=0
@@ -23,7 +22,7 @@ usage() {
 tg-naive install
 
   bash install.sh
-  bash install.sh --hostname FQDN --email you@example.com [--site NAME] [--secret HEX] [-y]
+  bash install.sh --hostname FQDN [--site NAME] [--secret HEX] [-y]
 
   -y, --yes      не спрашивать подтверждение перед установкой
   --dry-run      только показать, что будет сделано
@@ -45,7 +44,6 @@ resolve_site_id() {
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--hostname) hostname="${2:-}"; shift 2 ;;
-		--email) email="${2:-}"; shift 2 ;;
 		--site) site="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
 		-y|--yes) assume_yes=1; shift ;;
@@ -113,19 +111,11 @@ validate_hostname() {
 	local h err=""
 	h="$(normalize_hostname "$1")"
 	[[ -n "$h" ]] || { err='пусто'; printf '%s' "$err"; return 1; }
-	[[ "$h" == *.* ]] || { err='нужен домен с точкой, например tweb.kurduk.store'; printf '%s' "$err"; return 1; }
+	[[ "$h" == *.* ]] || { err='нужен домен с точкой, например endpoint.hy2.fun'; printf '%s' "$err"; return 1; }
 	[[ ${#h} -le 253 ]] || { err='слишком длинный'; printf '%s' "$err"; return 1; }
 	[[ "$h" =~ ^[a-z0-9]([a-z0-9-]*(\.[a-z0-9-]+)+)*$ ]] || { err='только a-z, 0-9, дефис и точки; без https:// и слэшей'; printf '%s' "$err"; return 1; }
 	printf '%s' "$h"
 	return 0
-}
-
-validate_email() {
-	local e="$1"
-	e="${e//$'\r'/}"
-	e="${e#"${e%%[![:space:]]*}"}"
-	e="${e%"${e##*[![:space:]]}"}"
-	[[ "$e" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
 }
 
 interactive_setup() {
@@ -133,9 +123,9 @@ interactive_setup() {
 	ui_intro
 	ui_line
 
-	ui_out "${UI_BOLD}Шаг 1 из 4 · домен для WEB proxy${UI_RESET}\n"
+	ui_out "${UI_BOLD}Шаг 1 из 3 · домен для WEB proxy${UI_RESET}\n"
 	ui_info 'Тот же hostname, что в DNS A-записи и в Telegram Desktop.'
-	ui_info 'Пример: tweb.kurduk.store (без https:// и без :443)'
+	ui_info 'Пример: endpoint.hy2.fun (без https:// и без портов)'
 
 	while [[ -z "$hostname" ]]; do
 		raw="$(ui_ask 'Hostname' '')"
@@ -148,22 +138,7 @@ interactive_setup() {
 	done
 	ui_ok "hostname: $hostname"
 
-	ui_out "\n${UI_BOLD}Шаг 2 из 4 · email для сертификата${UI_RESET}\n"
-	ui_info 'Let'\''s Encrypt пришлёт уведомления сюда, если что-то пойдёт не так.'
-
-	while [[ -z "$email" ]]; do
-		email="$(ui_ask 'Email' '')"
-		email="${email//$'\r'/}"
-		if ! validate_email "$email"; then
-			ui_warn 'нужен нормальный email, например admin@kurduk.store'
-			email=""
-		fi
-	done
-	ui_ok "email: $email"
-
-	ui_info 'Шаблон сайта выберем после загрузки кода (шаг 3 из 5).'
-
-	ui_out "\n${UI_BOLD}Шаг 3 из 4 · ключ${UI_RESET}\n"
+	ui_out "\n${UI_BOLD}Шаг 2 из 3 · ключ${UI_RESET}\n"
 	if [[ -z "$secret" ]]; then
 		if ui_ask_yes 'Сгенерировать ключ автоматически?' 'y'; then
 			secret=""
@@ -183,7 +158,6 @@ interactive_setup() {
 	ui_line
 	ui_box 'Проверь и жми Enter для старта' \
 		"Hostname : $hostname" \
-		"Email    : $email" \
 		"Site     : ${site:-выбор после git clone}" \
 		"Docker   : $(docker_status_hint)" \
 		"Каталог  : $INSTALL_DIR"
@@ -339,14 +313,14 @@ ensure_repo() {
 
 deploy_stack() {
 	ui_step 3 4 'Сборка и запуск'
-	args=(--local --hostname "$hostname" --email "$email" --site "$site")
+	args=(--local --hostname "$hostname" --site "$site")
 	[[ -n "$secret" ]] && args+=(--secret "$secret")
 	bash "$INSTALL_DIR/scripts/install-docker.sh" "${args[@]}"
 }
 
 preflight
 
-if [[ -z "$hostname" || -z "$email" ]]; then
+if [[ -z "$hostname" ]]; then
 	interactive_setup
 else
 	ui_banner
@@ -356,7 +330,6 @@ else
 	if [[ "$assume_yes" -eq 0 ]] && ui_is_tty; then
 		ui_box 'Параметры' \
 			"Hostname : $hostname" \
-			"Email    : $email" \
 			"Site     : $site" \
 			"Docker   : $(docker_status_hint)"
 		ui_ask_yes 'Продолжить?' 'y' || exit 0
@@ -369,15 +342,10 @@ else
 	ui_fail "$normalized"
 	exit 2
 fi
-if ! validate_email "$email"; then
-	ui_fail 'email не прошёл проверку'
-	exit 2
-fi
 
 if [[ "$dry_run" -eq 1 ]]; then
 	ui_box 'dry-run' \
 		"hostname=$hostname" \
-		"email=$email" \
 		"site=${site:-studio-garden}" \
 		"docker=$(docker_status_hint)" \
 		"dir=$INSTALL_DIR"

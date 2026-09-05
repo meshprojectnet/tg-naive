@@ -1,364 +1,105 @@
 #!/usr/bin/env bash
-# tg-naive · установщик на VPS (использование собственных SSL-сертификатов)
+# tg-naive · локальная или SSH-сборка/деплой через Docker Compose
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/meshprojectnet/tg-naive/main/install.sh)
+# Запуск локально:
+#   bash scripts/install-docker.sh --local --hostname endpoint.hy2.fun --site studio-garden [--secret HEX]
 #
-# Можно без флагов — спросит hostname и сайт в диалоге.
-# Или сразу: --hostname proxy.example.com --site atlas-books
+# Запуск по SSH:
+#   bash scripts/install-docker.sh --ssh user@host --hostname endpoint.hy2.fun --site studio-garden
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/tg-naive}"
-REPO_URL="${REPO_URL:-https://github.com/meshprojectnet/tg-naive.git}"
-REPO_REF="${REPO_REF:-main}"
-
+mode=""
+ssh_target=""
 hostname=""
 site=""
 secret=""
-assume_yes=0
-dry_run=0
+repo_dir=""
 
 usage() {
 	cat <<'EOF'
-tg-naive install
+tg-naive deploy
 
-  bash install.sh
-  bash install.sh --hostname FQDN [--site NAME] [--secret HEX] [-y]
+  install-docker.sh --local --hostname FQDN --site NAME [--secret HEX]
+  install-docker.sh --ssh user@host --hostname FQDN --site NAME
 
-  -y, --yes      не спрашивать подтверждение перед установкой
-  --dry-run      только показать, что будет сделано
+  --local          выполнять сборку и запуск на текущем хосте
+  --ssh TARGET     выполнять сборку и запуск на удалённом сервере по SSH
+  --hostname FQDN  домен (например, endpoint.hy2.fun)
+  --site NAME      имя шаблона сайта (например, studio-garden)
+  --secret HEX     (опционально) 32 hex-символа секрета MTProxy
 EOF
-}
-
-resolve_site_id() {
-	case "$1" in
-		1|northwind-field) printf '%s' 'northwind-field' ;;
-		2|studio-garden) printf '%s' 'studio-garden' ;;
-		3|atlas-books) printf '%s' 'atlas-books' ;;
-		4|harbor-dental) printf '%s' 'harbor-dental' ;;
-		5|craft-roastery) printf '%s' 'craft-roastery' ;;
-		6|pixel-repair) printf '%s' 'pixel-repair' ;;
-		*) return 1 ;;
-	esac
+	exit 1
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+		--local) mode="local"; shift ;;
+		--ssh) mode="ssh"; ssh_target="${2:-}"; shift 2 ;;
 		--hostname) hostname="${2:-}"; shift 2 ;;
 		--site) site="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
-		-y|--yes) assume_yes=1; shift ;;
-		--dry-run) dry_run=1; shift ;;
-		-h|--help) usage; exit 0 ;;
-		*) echo "неизвестный аргумент: $1" >&2; usage; exit 2 ;;
+		--email) shift 2 ;; # Игнорируем флаг email для обратной совместимости
+		-h|--help) usage ;;
+		*) echo "Неизвестный параметр: $1" >&2; usage ;;
 	esac
 done
 
-if [[ -n "$site" ]]; then
-	if resolved="$(resolve_site_id "$site")"; then
-		site="$resolved"
-	fi
-fi
+[[ -z "$mode" || -z "$hostname" || -z "$site" ]] && usage
 
-UI_SH=""
-if [[ -f "$(dirname "${BASH_SOURCE[0]}")/scripts/ui.sh" ]]; then
-	UI_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/ui.sh"
-elif [[ -f "$INSTALL_DIR/scripts/ui.sh" ]]; then
-	UI_SH="$INSTALL_DIR/scripts/ui.sh"
-fi
-if [[ -z "$UI_SH" ]]; then
-	UI_TMP_DIR="$(mktemp -d /tmp/tg-naive-ui.XXXXXX)"
-	base="https://raw.githubusercontent.com/meshprojectnet/tg-naive/${REPO_REF}/scripts"
-	if curl -fsSL --proto '=https' --tlsv1.2 "$base/ui.sh" -o "$UI_TMP_DIR/ui.sh" 2>/dev/null; then
-		curl -fsSL --proto '=https' --tlsv1.2 "$base/sites.sh" -o "$UI_TMP_DIR/sites.sh" 2>/dev/null || true
-		UI_SH="$UI_TMP_DIR/ui.sh"
-	fi
-fi
-if [[ -n "$UI_SH" && -f "$UI_SH" ]]; then
-	# shellcheck source=scripts/ui.sh
-	source "$UI_SH"
-else
-	ui_banner() { echo 'tg-naive install'; }
-	ui_line() { echo '---'; }
-	ui_step() { printf '[%s/%s] %s\n' "$1" "$2" "$3"; }
-	ui_ok() { printf 'OK: %s\n' "$1"; }
-	ui_warn() { printf 'WARN: %s\n' "$1"; }
-	ui_fail() { printf 'ERR: %s\n' "$1" >&2; }
-	ui_info() { printf '%s\n' "$1"; }
-	ui_box() { shift; while [[ $# -gt 0 ]]; do echo "$1"; shift; done; }
-	ui_ask() { local p="$1" d="${2:-}"; [[ -n "$d" ]] && printf '%s [%s]: ' "$p" "$d" || printf '%s: ' "$p"; IFS= read -r r; [[ -z "$r" && -n "$d" ]] && r="$d"; printf '%s' "$r"; }
-	ui_ask_yes() { local p="$1"; printf '%s [Y/n]: ' "$p"; IFS= read -r r; [[ -z "$r" || "$r" == y || "$r" == Y || "$r" == да ]]; }
-	ui_pick_site() { printf '%s' "${2:-studio-garden}"; }
-	ui_spin() { echo "$1"; }
-	ui_spin_done() { :; }
-	ui_credentials_box() { ui_box 'Готово' "hostname=$1" "secret=$2" "site=$3"; }
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-normalize_hostname() {
-	local h="$1"
-	h="${h//$'\r'/}"
-	h="${h#"${h%%[![:space:]]*}"}"
-	h="${h%"${h##*[![:space:]]}"}"
-	h="${h,,}"
-	h="${h#https://}"
-	h="${h#http://}"
-	h="${h%%/*}"
-	h="${h%%:*}"
-	h="${h%.}"
-	printf '%s' "$h"
-}
-
-validate_hostname() {
-	local h err=""
-	h="$(normalize_hostname "$1")"
-	[[ -n "$h" ]] || { err='пусто'; printf '%s' "$err"; return 1; }
-	[[ "$h" == *.* ]] || { err='нужен домен с точкой, например endpoint.hy2.fun'; printf '%s' "$err"; return 1; }
-	[[ ${#h} -le 253 ]] || { err='слишком длинный'; printf '%s' "$err"; return 1; }
-	[[ "$h" =~ ^[a-z0-9]([a-z0-9-]*(\.[a-z0-9-]+)+)*$ ]] || { err='только a-z, 0-9, дефис и точки; без https:// и слэшей'; printf '%s' "$err"; return 1; }
-	printf '%s' "$h"
-	return 0
-}
-
-interactive_setup() {
-	ui_banner
-	ui_intro
-	ui_line
-
-	ui_out "${UI_BOLD}Шаг 1 из 3 · домен для WEB proxy${UI_RESET}\n"
-	ui_info 'Тот же hostname, что в DNS A-записи и в Telegram Desktop.'
-	ui_info 'Пример: endpoint.hy2.fun (без https:// и без портов)'
-
-	while [[ -z "$hostname" ]]; do
-		raw="$(ui_ask 'Hostname' '')"
-		if normalized="$(validate_hostname "$raw")"; then
-			hostname="$normalized"
-		else
-			ui_warn "$normalized"
-			[[ -n "$raw" ]] && ui_info "введено: «${raw}»"
-		fi
-	done
-	ui_ok "hostname: $hostname"
-
-	ui_out "\n${UI_BOLD}Шаг 2 из 3 · ключ${UI_RESET}\n"
-	if [[ -z "$secret" ]]; then
-		if ui_ask_yes 'Сгенерировать ключ автоматически?' 'y'; then
-			secret=""
-		else
-			while true; do
-				secret="$(ui_ask 'Ключ (32 hex, dd в начале — по желанию)' '')"
-				secret="${secret,,}"
-				if [[ "$secret" =~ ^([0-9a-f]{32}|dd[0-9a-f]{32})$ ]]; then
-					break
-				fi
-				ui_warn 'нужно ровно 32 hex-символа'
-				secret=""
-			done
-		fi
-	fi
-
-	ui_line
-	ui_box 'Проверь и жми Enter для старта' \
-		"Hostname : $hostname" \
-		"Site     : ${site:-выбор после git clone}" \
-		"Docker   : $(docker_status_hint)" \
-		"Каталог  : $INSTALL_DIR"
-
-	if [[ "$assume_yes" -eq 0 ]]; then
-		if ! ui_ask_yes 'Начать установку?' 'y'; then
-			ui_warn 'отменено'
-			exit 0
-		fi
-	fi
-}
-
-preflight() {
-	if [[ "$(id -u)" -ne 0 ]]; then
-		ui_fail 'запускай от root: sudo bash install.sh'
-		exit 1
-	fi
-	if [[ "$(uname -m)" != "x86_64" ]]; then
-		ui_fail 'нужен x86_64 — так собран MTProxy внутри образа'
-		exit 1
-	fi
-	if ! command -v curl >/dev/null 2>&1; then
-		ui_fail 'нужен curl'
-		exit 1
-	fi
-}
-
-docker_has_cli() {
-	command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
-}
-
-docker_daemon_running() {
-	docker info >/dev/null 2>&1
-}
-
-docker_status_hint() {
-	if docker_has_cli && docker_daemon_running; then
-		printf '%s' "$(docker --version 2>/dev/null | head -1 | cut -d, -f1)"
-	elif docker_has_cli; then
-		printf '%s' 'установлен, не запущен'
+generate_secret() {
+	if command -v openssl >/dev/null 2>&1; then
+		openssl rand -hex 16
 	else
-		printf '%s' 'не найден'
+		head -c 16 /dev/urandom | xxd -p | tr -d '\n'
 	fi
 }
 
-confirm_docker_action() {
-	local prompt="$1"
-	if [[ "$assume_yes" -eq 1 ]]; then
-		return 0
-	fi
-	ui_ask_yes "$prompt" 'y'
-}
-
-start_docker_daemon() {
-	ui_spin 'запускаю docker'
-	if command -v systemctl >/dev/null 2>&1; then
-		systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker
-	elif command -v service >/dev/null 2>&1; then
-		service docker start
-	else
-		ui_spin_done
-		ui_fail 'не могу запустить docker — нет systemctl/service'
-		return 1
-	fi
-	ui_spin_done
-	docker_daemon_running
-}
-
-install_docker_packages() {
-	ui_spin 'ставлю docker (get.docker.com)'
-	export DEBIAN_FRONTEND=noninteractive
-	if command -v apt-get >/dev/null 2>&1; then
-		apt-get update -qq
-		apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg
-	fi
-	curl -fsSL https://get.docker.com | sh
-	if command -v apt-get >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
-		apt-get install -y -qq --no-install-recommends docker-compose-plugin || true
-	fi
-	if command -v systemctl >/dev/null 2>&1; then
-		systemctl enable --now docker >/dev/null 2>&1 || true
-	fi
-	ui_spin_done
-}
-
-ensure_docker() {
-	ui_step 1 4 'Docker'
-
-	if docker_has_cli && docker_daemon_running; then
-		ui_ok "$(docker --version | head -1)"
-		return 0
-	fi
-
-	if docker_has_cli && ! docker_daemon_running; then
-		ui_warn 'Docker установлен, но служба не запущена'
-		if ! confirm_docker_action 'Запустить Docker сейчас?'; then
-			ui_fail 'нужен запущенный Docker — установка отменена'
-			exit 1
-		fi
-		if ! start_docker_daemon; then
-			ui_fail 'не удалось запустить docker — проверь: systemctl status docker'
-			exit 1
-		fi
-		ui_ok 'docker запущен'
-		return 0
-	fi
-
-	ui_warn 'Docker не найден (нужны docker и compose plugin)'
-	ui_info 'Будет установка через официальный скрипт get.docker.com'
-	if ! confirm_docker_action 'Установить Docker автоматически?'; then
-		ui_fail 'нужен Docker — установка отменена'
-		exit 1
-	fi
-	if ! command -v curl >/dev/null 2>&1; then
-		ui_fail 'нужен curl для установки Docker'
-		exit 1
-	fi
-	install_docker_packages
-	if ! docker_has_cli || ! docker_daemon_running; then
-		ui_fail 'Docker не поднялся — проверь логи: journalctl -u docker'
-		exit 1
-	fi
-	ui_ok 'docker установлен и запущен'
-}
-
-ensure_repo() {
-	ui_step 2 4 'Код'
-	if ! command -v git >/dev/null 2>&1; then
-		export DEBIAN_FRONTEND=noninteractive
-		apt-get update -qq
-		apt-get install -y -qq --no-install-recommends git
-	fi
-	mkdir -p "$(dirname "$INSTALL_DIR")"
-	ui_spin "git → $INSTALL_DIR"
-	if [[ -d "$INSTALL_DIR/.git" ]]; then
-		git -C "$INSTALL_DIR" fetch origin "$REPO_REF" -q
-		git -C "$INSTALL_DIR" checkout "$REPO_REF" -q
-		git -C "$INSTALL_DIR" pull --ff-only origin "$REPO_REF" -q
-	elif [[ -d "$INSTALL_DIR" ]]; then
-		ui_spin_done
-		ui_fail "$INSTALL_DIR есть, но это не git — убери каталог или переименуй"
-		exit 1
-	else
-		git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$INSTALL_DIR" -q
-	fi
-	ui_spin_done
-	ui_ok "$INSTALL_DIR"
-	# shellcheck source=scripts/ui.sh
-	if [[ -f "$INSTALL_DIR/scripts/ui.sh" ]]; then
-		source "$INSTALL_DIR/scripts/ui.sh"
-	fi
-}
-
-deploy_stack() {
-	ui_step 3 4 'Сборка и запуск'
-	args=(--local --hostname "$hostname" --site "$site")
-	[[ -n "$secret" ]] && args+=(--secret "$secret")
-	bash "$INSTALL_DIR/scripts/install-docker.sh" "${args[@]}"
-}
-
-preflight
-
-if [[ -z "$hostname" ]]; then
-	interactive_setup
-else
-	ui_banner
-	if [[ -z "$site" ]]; then
-		site="studio-garden"
-	fi
-	if [[ "$assume_yes" -eq 0 ]] && ui_is_tty; then
-		ui_box 'Параметры' \
-			"Hostname : $hostname" \
-			"Site     : $site" \
-			"Docker   : $(docker_status_hint)"
-		ui_ask_yes 'Продолжить?' 'y' || exit 0
-	fi
+if [[ -z "$secret" ]]; then
+	secret="$(generate_secret)"
 fi
 
-if normalized="$(validate_hostname "$hostname")"; then
-	hostname="$normalized"
-else
-	ui_fail "$normalized"
-	exit 2
+# Нормализация секрета (приведение к нижнему регистру)
+secret="${secret,,}"
+
+deploy_local() {
+	cd "$REPO_DIR"
+
+	echo "==> Создание конфигурационного файла .env..."
+	cat <<EOF > .env
+TPROXY_HOSTNAME=${hostname}
+TPROXY_SECRET=${secret}
+TPROXY_SITE=${site}
+EOF
+
+	echo "==> Сборка и запуск Docker контейнеров..."
+	docker compose up -d --build --remove-orphans
+
+	echo ""
+	echo "=================================================="
+	echo " Установка tg-naive успешно завершена!"
+	echo "=================================================="
+	echo " Hostname : ${hostname}"
+	echo " Site     : ${site}"
+	echo " Secret   : ${secret}"
+	echo "=================================================="
+}
+
+deploy_ssh() {
+	echo "==> Подключение к $ssh_target через SSH..."
+	ssh "$ssh_target" "mkdir -p /opt/tg-naive"
+	
+	echo "==> Копирование файлов проекта на $ssh_target..."
+	rsync -avz --exclude='.git' --exclude='runtime/site' "$REPO_DIR/" "$ssh_target:/opt/tg-naive/"
+
+	echo "==> Запуск установки на удалённом сервере..."
+	ssh "$ssh_target" "bash /opt/tg-naive/scripts/install-docker.sh --local --hostname '$hostname' --site '$site' --secret '$secret'"
+}
+
+if [[ "$mode" == "local" ]]; then
+	deploy_local
+elif [[ "$mode" == "ssh" ]]; then
+	deploy_ssh
 fi
-
-if [[ "$dry_run" -eq 1 ]]; then
-	ui_box 'dry-run' \
-		"hostname=$hostname" \
-		"site=${site:-studio-garden}" \
-		"docker=$(docker_status_hint)" \
-		"dir=$INSTALL_DIR"
-	exit 0
-fi
-
-ensure_docker
-ensure_repo
-
-if [[ -z "$site" ]]; then
-	ui_out "\n${UI_BOLD}Шаг 4 из 4 · сайт на вашем домене${UI_RESET}\n"
-	site="$(ui_pick_site "$INSTALL_DIR" "speedtest")"
-	ui_ok "site: $site"
-fi
-
-deploy_stack

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# tg-web-proxy · установщик на VPS
+# tg-naive · установщик на VPS
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/RTHeLL/tg-web-proxy/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/meshprojectnet/tg-naive/main/install.sh)
 #
 # Можно без флагов — спросит hostname, email и сайт в диалоге.
 # Или сразу: --hostname proxy.example.com --email you@example.com --site atlas-books
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/tg-web-proxy}"
-REPO_URL="${REPO_URL:-https://github.com/RTHeLL/tg-web-proxy.git}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/tg-naive}"
+REPO_URL="${REPO_URL:-https://github.com/meshprojectnet/tg-naive.git}"
 REPO_REF="${REPO_REF:-main}"
 
 hostname=""
@@ -20,13 +20,13 @@ dry_run=0
 
 usage() {
 	cat <<'EOF'
-tg-web-proxy install
+tg-naive install
 
   bash install.sh
   bash install.sh --hostname FQDN --email you@example.com [--site NAME] [--secret HEX] [-y]
 
-  -y, --yes     не спрашивать подтверждение перед установкой
-  --dry-run     только показать, что будет сделано
+  -y, --yes      не спрашивать подтверждение перед установкой
+  --dry-run      только показать, что будет сделано
 EOF
 }
 
@@ -68,8 +68,8 @@ elif [[ -f "$INSTALL_DIR/scripts/ui.sh" ]]; then
 	UI_SH="$INSTALL_DIR/scripts/ui.sh"
 fi
 if [[ -z "$UI_SH" ]]; then
-	UI_TMP_DIR="$(mktemp -d /tmp/tg-web-proxy-ui.XXXXXX)"
-	base="https://raw.githubusercontent.com/RTHeLL/tg-web-proxy/${REPO_REF}/scripts"
+	UI_TMP_DIR="$(mktemp -d /tmp/tg-naive-ui.XXXXXX)"
+	base="https://raw.githubusercontent.com/meshprojectnet/tg-naive/${REPO_REF}/scripts"
 	if curl -fsSL --proto '=https' --tlsv1.2 "$base/ui.sh" -o "$UI_TMP_DIR/ui.sh" 2>/dev/null; then
 		curl -fsSL --proto '=https' --tlsv1.2 "$base/sites.sh" -o "$UI_TMP_DIR/sites.sh" 2>/dev/null || true
 		UI_SH="$UI_TMP_DIR/ui.sh"
@@ -79,7 +79,7 @@ if [[ -n "$UI_SH" && -f "$UI_SH" ]]; then
 	# shellcheck source=scripts/ui.sh
 	source "$UI_SH"
 else
-	ui_banner() { echo 'tg-web-proxy install'; }
+	ui_banner() { echo 'tg-naive install'; }
 	ui_line() { echo '---'; }
 	ui_step() { printf '[%s/%s] %s\n' "$1" "$2" "$3"; }
 	ui_ok() { printf 'OK: %s\n' "$1"; }
@@ -211,17 +211,6 @@ preflight() {
 	fi
 }
 
-port_busy() {
-	port="$1"
-	if command -v ss >/dev/null 2>&1; then
-		ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
-	elif command -v netstat >/dev/null 2>&1; then
-		netstat -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$port\$"
-	else
-		return 1
-	fi
-}
-
 docker_has_cli() {
 	command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1
 }
@@ -281,7 +270,7 @@ install_docker_packages() {
 }
 
 ensure_docker() {
-	ui_step 2 5 'Docker'
+	ui_step 1 4 'Docker'
 
 	if docker_has_cli && docker_daemon_running; then
 		ui_ok "$(docker --version | head -1)"
@@ -321,7 +310,7 @@ ensure_docker() {
 }
 
 ensure_repo() {
-	ui_step 3 5 'Код'
+	ui_step 2 4 'Код'
 	if ! command -v git >/dev/null 2>&1; then
 		export DEBIAN_FRONTEND=noninteractive
 		apt-get update -qq
@@ -349,7 +338,7 @@ ensure_repo() {
 }
 
 deploy_stack() {
-	ui_step 4 5 'Сборка и запуск'
+	ui_step 3 4 'Сборка и запуск'
 	args=(--local --hostname "$hostname" --email "$email" --site "$site")
 	[[ -n "$secret" ]] && args+=(--secret "$secret")
 	bash "$INSTALL_DIR/scripts/install-docker.sh" "${args[@]}"
@@ -395,20 +384,11 @@ if [[ "$dry_run" -eq 1 ]]; then
 	exit 0
 fi
 
-ui_step 1 5 'Порты 80/443'
-for port in 80 443; do
-	if port_busy "$port"; then
-		ui_fail "порт $port занят — освободи nginx/apache/caddy на хосте"
-		exit 1
-	fi
-done
-ui_ok 'свободны'
-
 ensure_docker
 ensure_repo
 
 if [[ -z "$site" ]]; then
-	ui_out "\n${UI_BOLD}Шаг 4 из 5 · сайт на вашем домене${UI_RESET}\n"
+	ui_out "\n${UI_BOLD}Шаг 4 из 4 · сайт на вашем домене${UI_RESET}\n"
 	site="$(ui_pick_site "$INSTALL_DIR" "speedtest")"
 	ui_ok "site: $site"
 fi
